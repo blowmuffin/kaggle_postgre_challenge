@@ -67,6 +67,45 @@ After a successful cross-table **Expand** operation, the application displays a 
 
 Local work is measured with per-thread CPU time. Remote command work is clocked on the Linux server, and expansion statements are clocked inside PostgreSQL. SSH connection and result-return transit are therefore excluded from the measured processing total. The report can be exported as a UTF-8 `.txt` file.
 
+## Parallel, resumable Expand engine (challenge submission)
+
+This fork replaces the single all-or-nothing Expand transaction with a job that
+runs **on the Linux server**, in parallel, and survives interruptions. Nothing
+changes in how Expand is used: same button, same six recipes, same report.
+Design, measurements and trade-offs are in **[WRITEUP.md](./WRITEUP.md)**;
+reproduction commands are in **[benchmarks/README.md](./benchmarks/README.md)**.
+
+What it does, in short:
+
+- The recipes are executed verbatim. Only the `{{source}}` relation is cut into
+  `raw_id` ranges, and only for recipes where that provably cannot change the
+  result; everything else runs once over the whole source as before.
+- One PostgreSQL session per core commits one range per transaction, together
+  with its row counters and a checkpoint row.
+- Foreign keys and secondary indexes of the loaded tables are validated/built
+  once, in bulk, by PostgreSQL itself, instead of row by row. The job cannot
+  finish unless every one of them is back and valid.
+- If the SSH link or the Manager dies, the job keeps running; if the server
+  dies, the next **Expand** resumes from the committed ranges. An unfinished
+  job can be **resumed or discarded** (rolled back) from the Expand button.
+- Version registration is done by the job itself and is exactly-once.
+
+Requirements beyond the original: PostgreSQL 11+, `bash`, `setsid`, `nohup`,
+`nproc` on the server. No extension, no superuser, no configuration change.
+The job keeps its bookkeeping in three small tables in schema `pgdm_expansion`
+of the data database, one table `app_control.expansion_job_registrations` in
+the control database, and its logs under
+`~/postgres_data_manager_storage/expansion_jobs/<job id>/` on the server.
+
+`PDM_EXPAND_ENGINE=legacy` runs the original engine unchanged; the other
+switches are listed in [benchmarks/README.md](./benchmarks/README.md#engine-switches).
+
+```bash
+python -m unittest discover -s tests          # planner and timing tests
+python tools/expand_cli.py --env <env> run    # headless Expand (same calls as the GUI)
+bash benchmarks/recovery_test.sh <env> all    # interruption scenarios
+```
+
 ## Main dependencies
 
 - CustomTkinter

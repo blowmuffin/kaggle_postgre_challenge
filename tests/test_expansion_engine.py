@@ -4,6 +4,7 @@ from pathlib import Path
 
 from services import expansion_engine as engine
 
+JOB = "0123456789abcdef0123456789abcdef"
 RECIPES = Path(__file__).resolve().parent.parent / "SQL files"
 
 
@@ -31,7 +32,7 @@ def official_destinations():
 
 def plan(destinations, aggregates=(), chunkable=True):
     return engine.build_plan(
-        "0123456789abcdef", "public", "raw_data", ["group001"], destinations, set(aggregates), chunkable
+        JOB, "public", "raw_data", ["group001"], destinations, set(aggregates), chunkable
     )
 
 
@@ -207,19 +208,19 @@ class RewriteTests(unittest.TestCase):
 class GeneratedSqlTests(unittest.TestCase):
     def test_server_scripts_render(self):
         config = {"workers": 4, "sequence_cache": 256}
-        control = engine.control_sql("abc", "public", "raw_data", ["group001"], config, True)
+        control = engine.control_sql(JOB, "public", "raw_data", ["group001"], config, True)
         self.assertIn("pg_try_advisory_lock", control)
         self.assertIn("NOT VALID", control)
         self.assertIn("USING INDEX", control)
         for text in (
             control,
-            engine.worker_sql("abc"),
-            engine.locker_sql("abc", "public", "raw_data"),
-            engine.abort_sql("abc"),
+            engine.worker_sql(JOB),
+            engine.locker_sql(JOB, "public", "raw_data"),
+            engine.abort_sql(JOB),
         ):
             # liveness checks must never read a stale pg_stat_activity snapshot
             self.assertIn("pg_stat_clear_snapshot()", text)
-        script = engine.launch_script("store/expansion_jobs/abc", {"a.sql": "SELECT 1;"}, "abc")
+        script = engine.launch_script("store/expansion_jobs/" + JOB, {"a.sql": "SELECT 1;"}, JOB)
         self.assertIn("setsid nohup bash runner.sh", script)
 
 

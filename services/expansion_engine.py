@@ -858,11 +858,25 @@ BEGIN
         WHERE n.nspname = '{JOB_SCHEMA}' AND c.relkind = 'r'
           AND NOT pg_catalog.pg_has_role(c.relowner, 'USAGE'))
        OR EXISTS (
-        SELECT 1 FROM information_schema.role_table_grants g
-        WHERE g.table_schema = '{JOB_SCHEMA}'
-          AND g.privilege_type IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
-          AND g.grantee <> current_user
-          AND NOT pg_catalog.pg_has_role(g.grantee, 'USAGE'))
+        SELECT 1 FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) a
+        WHERE n.nspname = '{JOB_SCHEMA}' AND c.relkind = 'r'
+          AND a.privilege_type IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'TRIGGER', 'REFERENCES')
+          AND (a.grantee = 0 OR NOT pg_catalog.pg_has_role(a.grantee, 'USAGE')))
+       OR EXISTS (
+        SELECT 1 FROM pg_catalog.pg_attribute t
+        JOIN pg_catalog.pg_class c ON c.oid = t.attrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        CROSS JOIN LATERAL pg_catalog.aclexplode(t.attacl) a
+        WHERE n.nspname = '{JOB_SCHEMA}' AND c.relkind = 'r'
+          AND a.privilege_type IN ('INSERT', 'UPDATE', 'REFERENCES')
+          AND (a.grantee = 0 OR NOT pg_catalog.pg_has_role(a.grantee, 'USAGE')))
+       OR EXISTS (
+        SELECT 1 FROM pg_catalog.pg_trigger g
+        JOIN pg_catalog.pg_class c ON c.oid = g.tgrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = '{JOB_SCHEMA}' AND NOT g.tgisinternal)
     THEN
         RAISE EXCEPTION 'The {JOB_SCHEMA} job tables are owned or writable by another role; refusing to execute their stored statements.';
     END IF;
@@ -1927,7 +1941,13 @@ FROM {JOB_SCHEMA}.jobs WHERE job_id = {j};
 
 
 def request_sql(source_schema: str, source_table: str) -> str:
+    # The stored request is offered back to the user for "Resume": only trust
+    # it from job tables nobody else can write to. (It still goes through the
+    # complete recipe validation and must reproduce the job's signature.)
     return f"""
+\\set ON_ERROR_STOP on
+SET client_min_messages = warning;
+{OWNERSHIP_GUARD}
 SELECT to_regclass('{JOB_SCHEMA}.jobs') IS NOT NULL AS pgdm_has_jobs \\gset
 \\if :pgdm_has_jobs
 SELECT json_build_object(
