@@ -84,7 +84,7 @@ discards the running job (same guarantee as the original rollback).
 
 ## Resource use
 
-`sample_resources.sh start|stop` (on the server, as root) reports peak
+`sample_resources.sh start`, `loop &`, then `stop` (on the server, as root) reports peak
 PostgreSQL memory as PSS (shared buffers counted once), temp-file bytes and
 WAL volume for one run.
 

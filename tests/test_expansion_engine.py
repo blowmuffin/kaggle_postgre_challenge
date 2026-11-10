@@ -223,6 +223,16 @@ class GeneratedSqlTests(unittest.TestCase):
         script = engine.launch_script("store/expansion_jobs/" + JOB, {"a.sql": "SELECT 1;"}, JOB)
         self.assertIn("setsid nohup bash runner.sh", script)
 
+    def test_stale_job_check_names_every_destination(self):
+        sql = engine.stale_job_sql(JOB, [("public", "t1"), ("public", "t2")])
+        self.assertIn(f"t.job_id = '{JOB}'", sql)
+        self.assertIn("jsonb_each_text(t.rows)", sql)
+        for table in ("t1", "t2"):
+            self.assertIn(f"NOT EXISTS (SELECT 1 FROM {engine.sql_ident('public')}."
+                          f"{engine.sql_ident(table)})", sql)
+        with self.assertRaises(engine.UnsupportedSql):
+            engine.stale_job_sql("x'; DROP TABLE t1; --", [("public", "t1")])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1751,6 +1751,25 @@ def status_sql(job_id: str) -> str:
     )
 
 
+def stale_job_sql(job_id: str, destinations) -> str:
+    """Whether the rows a job committed are gone: its done tasks inserted rows,
+    yet every destination (schema, table) is empty now (TRUNCATE, restore)."""
+    job_id = checked_job_id(job_id)
+    if not destinations:
+        raise ValueError("A stale-job check needs at least one destination table.")
+    empty = "".join(
+        f"\n    AND NOT EXISTS (SELECT 1 FROM {sql_ident(schema)}.{sql_ident(table)})"
+        for schema, table in destinations
+    )
+    return f"""
+SELECT json_build_object('stale', COALESCE((
+        SELECT sum(r.value::bigint)
+        FROM {JOB_SCHEMA}.job_tasks t, jsonb_each_text(t.rows) r
+        WHERE t.job_id = {sql_literal(job_id)} AND t.state = 'done'), 0) > 0{empty}
+)::text;
+""".strip() + "\n"
+
+
 def summary_sql(job_id: str, acknowledge: bool) -> str:
     job_id = checked_job_id(job_id)
     j = sql_literal(job_id)

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Resource footprint of one Expand run, measured on the Linux server (as root).
-#   sample_resources.sh start <dir>   -> begins sampling in the background
+#   sample_resources.sh start <dir>   -> records the baselines
+#   sample_resources.sh loop  <dir> & -> samples memory until "stop" (keep it attached:
+#                                        a detached child does not survive a wsl.exe call)
 #   sample_resources.sh stop  <dir>   -> prints peak PostgreSQL memory (PSS, shared
 #                                        pages counted once), temp-file bytes and WAL
 set -u
-MODE="${1:?start|stop}"; DIR="${2:?state dir}"   # mode "loop" is internal
+MODE="${1:?start|loop|stop}"; DIR="${2:?state dir}"
 q() { sudo -u postgres psql -qAt -d kaggle_challenge -c "$1"; }
 pss_mb() {
   local total=0 v
@@ -15,16 +17,16 @@ pss_mb() {
   echo $((total / 1024))
 }
 if [ "$MODE" = start ]; then
-  mkdir -p "$DIR"; rm -f "$DIR/stop"
+  mkdir -p "$DIR"; rm -f "$DIR/stop" "$DIR/peak" "$DIR/series"
   q "SELECT temp_bytes FROM pg_stat_database WHERE datname = current_database()" > "$DIR/temp0"
   q "SELECT pg_current_wal_lsn()" > "$DIR/lsn0"
   pss_mb > "$DIR/pss0"
-  setsid nohup bash "$0" loop "$DIR" > /dev/null 2>&1 < /dev/null &
 elif [ "$MODE" = loop ]; then
   peak=0
   while [ ! -e "$DIR/stop" ]; do
     v=$(pss_mb)
     if [ "$v" -gt "$peak" ]; then peak=$v; echo "$peak" > "$DIR/peak"; fi
+    echo "$(date +%s) $v" >> "$DIR/series"   # time series: shows in which phase the peak falls
     sleep 0.5
   done
 else

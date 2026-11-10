@@ -331,6 +331,52 @@ FROM inserted_version;
             job for job in jobs if job["status"] == "completed" and job["signature"] == signature
         ]
         launch, resumed = True, False
+        reuse = active[0] if active else finished[0] if finished else None
+        if (
+            reuse is not None
+            and reuse["signature"] == signature
+            and not reuse["alive"]
+            # "running" without a live controller is a job whose sessions were killed
+            and reuse["status"] in ("completed", "running", "interrupted", "failed", "created")
+        ):
+            # The destinations were emptied (TRUNCATE, restore) after the job
+            # committed its rows: collecting or resuming it would be wrong data.
+            with self.expansion_timing_scope(
+                timing_report, "preflight", "Check earlier job against destination contents"
+            ):
+                check = self._expansion_json(
+                    database_name,
+                    engine.stale_job_sql(reuse["job_id"], [d.key for d in plan_destinations]),
+                    cancel_event,
+                )
+            if check and check[0].get("stale"):
+                if reuse["status"] == "completed":
+                    with self.expansion_timing_scope(
+                        timing_report, "preflight", "Acknowledge stale completed job"
+                    ):
+                        self._expansion_json(
+                            database_name, engine.summary_sql(reuse["job_id"], True), cancel_event
+                        )
+                else:
+                    try:
+                        with self.expansion_timing_scope(
+                            timing_report, "preflight", "Discard stale unfinished job"
+                        ):
+                            result = self._expansion_json(
+                                database_name, engine.abort_sql(reuse["job_id"]), cancel_event
+                            )
+                    except OperationCancelledError:
+                        raise
+                    except Exception as exc:
+                        result = [{"detail": str(exc)}]
+                    if not result or result[0].get("status") != "aborted":
+                        raise RuntimeError(
+                            f"Expansion job {reuse['job_id']} refers to rows that are no longer "
+                            "in the destination tables and could not be discarded automatically; "
+                            "discard it manually (Expand > Discard, or 'python tools/expand_cli.py "
+                            f"abort') and run Expand again.\n\n{(result or [{}])[0].get('detail') or ''}"
+                        )
+                active, finished = [], []
         if active:
             job = active[0]
             if job["signature"] != signature:
