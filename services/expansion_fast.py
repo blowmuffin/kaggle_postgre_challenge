@@ -52,7 +52,11 @@ class FastExpansionMixin:
     @staticmethod
     def _fast_expansion_config(nproc: int, probe: dict) -> dict:
         requested = (os.getenv("PDM_EXPAND_WORKERS") or "auto").strip().lower()
-        workers = int(requested) if requested.isdigit() else nproc
+        # Default: every core on small servers; on larger ones leave a quarter
+        # for the WAL writer, checkpointer and the hyper-threads that add little.
+        workers = int(requested) if requested.isdigit() else (
+            nproc if nproc <= 4 else nproc - nproc // 4
+        )
         free = int(probe["max_connections"]) - int(probe["connections"]) - 5
         return {
             "workers": max(1, min(workers, 32, free)),
@@ -443,8 +447,17 @@ FROM inserted_version;
                         self._expansion_psql(database_name), stdin_text=engine.abort_sql(job_id)
                     )
                 raise OperationCancelledError("Operacao cancelada pelo usuario.")
-            with self.expansion_timing_scope(None, "execute", "Poll job"):
-                states = self._expansion_json(database_name, engine.status_sql(job_id))
+            try:
+                with self.expansion_timing_scope(None, "execute", "Poll job"):
+                    states = self._expansion_json(database_name, engine.status_sql(job_id))
+            except Exception as exc:
+                if cancel_event is not None and cancel_event.is_set() and not committed:
+                    continue  # the Cancel button closed this poll; discard above
+                raise RuntimeError(
+                    f"Lost contact with the server while expansion job {job_id} was "
+                    "running. The job itself keeps running there. Reconnect and click "
+                    f"Expand again to re-attach to it.\n\n{exc}"
+                ) from exc
             polls += 1
             if not states:
                 raise RuntimeError(f"Expansion job {job_id} disappeared from the server.")

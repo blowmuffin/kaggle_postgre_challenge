@@ -832,12 +832,51 @@ WHERE current_setting('server_version_num')::int >= 140000;
 """.strip()
 
 
+_JOB_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def checked_job_id(job_id) -> str:
+    """Job ids are embedded in SQL and shell text; accept only our own format,
+    including when the id was read back from the server."""
+    if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):
+        raise UnsupportedSql("invalid expansion job id")
+    return job_id
+
+
+# The job tables hold SQL that the sessions EXECUTE. Refuse to run unless they
+# belong to the connected role and nobody else may write to them.
+OWNERSHIP_GUARD = f"""
+DO $pgdm_guard$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_catalog.pg_namespace n
+        WHERE n.nspname = '{JOB_SCHEMA}'
+          AND NOT pg_catalog.pg_has_role(n.nspowner, 'USAGE'))
+       OR EXISTS (
+        SELECT 1 FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = '{JOB_SCHEMA}' AND c.relkind = 'r'
+          AND NOT pg_catalog.pg_has_role(c.relowner, 'USAGE'))
+       OR EXISTS (
+        SELECT 1 FROM information_schema.role_table_grants g
+        WHERE g.table_schema = '{JOB_SCHEMA}'
+          AND g.privilege_type IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
+          AND g.grantee <> current_user
+          AND NOT pg_catalog.pg_has_role(g.grantee, 'USAGE'))
+    THEN
+        RAISE EXCEPTION 'The {JOB_SCHEMA} job tables are owned or writable by another role; refusing to execute their stored statements.';
+    END IF;
+END
+$pgdm_guard$;
+""".strip()
+
+
 def _lock_key(job_id: str) -> str:
     return f"hashtextextended({sql_literal('pgdm_expansion_job:' + job_id)}, 0)"
 
 
 def create_job_sql(job: dict) -> str:
-    job_id = sql_literal(job["job_id"])
+    job_id = sql_literal(checked_job_id(job["job_id"]))
     return f"""
 \\set ON_ERROR_STOP on
 BEGIN;
@@ -883,6 +922,7 @@ COMMIT;
 
 
 def control_sql(job_id: str, source_schema: str, source_table: str, raw_schemas, config: dict, chunkable: bool) -> str:
+    job_id = checked_job_id(job_id)
     j = sql_literal(job_id)
     src = f"{sql_ident(source_schema)}.{sql_ident(source_table)}"
     src_lit = sql_literal(src)
@@ -946,6 +986,7 @@ SET application_name = {sql_literal('pgdm_expand_control:' + job_id)};
 {_SESSION_SETUP}
 SET lock_timeout = '300s';
 SELECT set_config('pgdm.launch_ts', :'launch_ts', false);
+{OWNERSHIP_GUARD}
 SELECT pg_try_advisory_lock({_lock_key(job_id)}) AS pgdm_got \\gset
 \\if :pgdm_got
 \\else
@@ -1377,6 +1418,7 @@ $pgdm_ctl$;
 
 
 def locker_sql(job_id: str, source_schema: str, source_table: str) -> str:
+    job_id = checked_job_id(job_id)
     j = sql_literal(job_id)
     src = f"{sql_ident(source_schema)}.{sql_ident(source_table)}"
     return f"""
@@ -1420,6 +1462,7 @@ $pgdm_lock$;
 
 
 def worker_sql(job_id: str) -> str:
+    job_id = checked_job_id(job_id)
     j = sql_literal(job_id)
     return f"""
 SET application_name = {sql_literal('pgdm_expand_worker:' + job_id)};
@@ -1429,6 +1472,8 @@ SET max_parallel_workers_per_gather = 0;
 SET jit = off;
 SELECT set_config('enable_memoize', 'off', false)
 WHERE current_setting('server_version_num')::int >= 140000;
+\\set ON_ERROR_STOP on
+{OWNERSHIP_GUARD}
 \\set ON_ERROR_STOP off
 DO $pgdm_worker$
 DECLARE
@@ -1549,6 +1594,7 @@ WHERE job_id = {j} AND status = 'running';
 
 
 def fail_sql(job_id: str) -> str:
+    job_id = checked_job_id(job_id)
     j = sql_literal(job_id)
     return f"""
 \\set pgdm_msg `tail -c 1500 control.err 2>/dev/null`
@@ -1565,6 +1611,7 @@ WHERE a.job_id = {j} AND a.finished_at IS NULL;
 
 
 def complete_sql(job_id: str) -> str:
+    job_id = checked_job_id(job_id)
     j = sql_literal(job_id)
     return f"""
 \\set ON_ERROR_STOP on
@@ -1584,6 +1631,7 @@ COMMIT;
 def runner_script(job_id: str, database: str, control_database: str, sql_username: str, workers: int) -> str:
     import shlex
 
+    job_id = checked_job_id(job_id)
     user, db, ctl = shlex.quote(sql_username), shlex.quote(database), shlex.quote(control_database)
     return f"""#!/usr/bin/env bash
 # Detached expansion runner: survives the loss of the SSH session that
@@ -1616,7 +1664,9 @@ fi
 
 
 def launch_script(job_dir: str, files: dict[str, str], job_id: str) -> str:
-    marker = f"PGDM_EOF_{job_id}"
+    marker = f"PGDM_EOF_{checked_job_id(job_id)}"
+    if not re.fullmatch(r"[A-Za-z0-9_./-]+", job_dir) or ".." in job_dir:
+        raise UnsupportedSql("unsafe remote job directory")
     parts = ["set -e", f'JOBDIR="$HOME"/{job_dir}', 'mkdir -p "$JOBDIR"', 'cd "$JOBDIR"', "chmod 700 ."]
     for name, content in files.items():
         if marker in content:
@@ -1674,6 +1724,7 @@ SELECT '[]';
 
 
 def status_sql(job_id: str) -> str:
+    job_id = checked_job_id(job_id)
     j = sql_literal(job_id)
     return (
         "SELECT json_build_object('status', j.status, 'phase', j.phase, "
@@ -1687,6 +1738,7 @@ def status_sql(job_id: str) -> str:
 
 
 def summary_sql(job_id: str, acknowledge: bool) -> str:
+    job_id = checked_job_id(job_id)
     j = sql_literal(job_id)
     ack = (
         f"UPDATE {JOB_SCHEMA}.jobs SET acknowledged = true WHERE job_id = {j} AND status = 'completed';\n"
@@ -1727,6 +1779,7 @@ FROM {JOB_SCHEMA}.jobs j WHERE j.job_id = {j};
 
 
 def cancel_sql(job_id: str) -> str:
+    job_id = checked_job_id(job_id)
     return (
         f"UPDATE {JOB_SCHEMA}.jobs SET cancel_requested = true "
         f"WHERE job_id = {sql_literal(job_id)} AND status IN ('created', 'running');"
@@ -1734,6 +1787,7 @@ def cancel_sql(job_id: str) -> str:
 
 
 def abort_sql(job_id: str) -> str:
+    job_id = checked_job_id(job_id)
     """Undo an unfinished job: remove exactly the rows its committed tasks
     inserted, put the row counters and foreign keys back, drop its artifacts."""
     j = sql_literal(job_id)
@@ -1743,6 +1797,7 @@ def abort_sql(job_id: str) -> str:
     return f"""
 \\set ON_ERROR_STOP on
 SET client_min_messages = warning;
+{OWNERSHIP_GUARD}
 -- Stop every session of the job before touching its rows.
 UPDATE {JOB_SCHEMA}.jobs SET cancel_requested = true
 WHERE job_id = {j} AND status IN ('created', 'running', 'interrupted', 'failed');

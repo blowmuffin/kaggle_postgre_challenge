@@ -5330,12 +5330,20 @@ class App(ctk.CTk):
                     f"Source {source_table_name} has no raw_schema registered "
                     "in version history."
                 )
+            try:
+                unfinished_job = self.service.get_unfinished_expansion_job(
+                    database_name,
+                    source_table_name,
+                )
+            except Exception:
+                unfinished_job = None
             self.ui(
                 self._open_cross_table_expansion_dialog,
                 database_name,
                 source_table_name,
                 available_tables,
                 raw_schemas,
+                unfinished_job,
             )
         except Exception as exc:
             self.ui(self.set_table_action_buttons_busy, False)
@@ -5348,12 +5356,20 @@ class App(ctk.CTk):
         source_table_name: str,
         available_tables,
         available_raw_schemas,
+        unfinished_job=None,
     ):
         if (
             self.current_db != database_name
             or self.selected_table_name != source_table_name
         ):
             self.set_table_action_buttons_busy(False)
+            return
+
+        if unfinished_job and self._handle_unfinished_expansion_job(
+            database_name,
+            source_table_name,
+            unfinished_job,
+        ):
             return
 
         expansion_request = self.ask_cross_table_expansion_info(
@@ -5392,6 +5408,89 @@ class App(ctk.CTk):
             source_table_name,
             expansion_request,
         )
+
+    def _handle_unfinished_expansion_job(
+        self,
+        database_name: str,
+        source_table_name: str,
+        job: dict,
+    ) -> bool:
+        """Explicit resume control for an interrupted expansion.
+
+        Returns True when the job was taken care of (resumed or discarded) and
+        the normal Expand dialog must not open."""
+        request = job.get("request") or {}
+        progress = f"{job.get('tasks_done', 0)}/{job.get('tasks_total', 0)}"
+        choice = messagebox.askyesnocancel(
+            "Unfinished expansion",
+            (
+                f"An expansion of {source_table_name} did not finish "
+                f"(job {str(job.get('job_id'))[:8]}, {job.get('status')}, "
+                f"{progress} tasks committed on the server).\n\n"
+                + (f"Last message: {job.get('error')}\n\n" if job.get("error") else "")
+                + "Yes - resume it: committed work is kept and only the rest runs.\n"
+                "No - discard it: every row it inserted is removed and the "
+                "destinations return to their previous state.\n"
+                "Cancel - leave it as it is."
+            ),
+            parent=self,
+        )
+        if choice is None:
+            self.set_table_action_buttons_busy(False)
+            return True
+        if not choice:
+            if job.get("status") == "data_complete":
+                self.set_table_action_buttons_busy(False)
+                self.show_error(
+                    "Cannot discard",
+                    "The data of this job is already committed; only its version "
+                    "registration is pending. Choose Yes to finish it.",
+                )
+                return True
+            self.set_status("Discarding the unfinished expansion...", "loading")
+            self.run_async(
+                self._discard_expansion_job_thread,
+                database_name,
+                source_table_name,
+            )
+            return True
+        if not request.get("destinations") or not request.get("raw_schemas"):
+            # Older job without a stored request: let the user re-enter it; the
+            # same recipes resume the job.
+            return False
+        expansion_request = {
+            "raw_schemas": list(request["raw_schemas"]),
+            "requested_by": request.get("requested_by") or "unknown",
+            "destinations": list(request["destinations"]),
+        }
+        self.begin_cross_table_expansion_cancellation_scope()
+        self.open_cross_table_expansion_progress(
+            database_name,
+            source_table_name,
+            len(expansion_request["destinations"]),
+        )
+        self.run_async(
+            self._execute_cross_table_expansion_thread,
+            database_name,
+            source_table_name,
+            expansion_request,
+        )
+        return True
+
+    def _discard_expansion_job_thread(self, database_name: str, source_table_name: str):
+        try:
+            result = self.service.abort_expansion_job(database_name, source_table_name)
+            self.ui(self.set_status, "Unfinished expansion discarded", "success")
+            self.ui(
+                self.show_info,
+                "Expansion discarded",
+                str(result.get("detail") or result.get("status") or "Done."),
+            )
+        except Exception as exc:
+            self.ui(self.set_status, "Could not discard the expansion", "error")
+            self.ui(self.show_error, "Error discarding expansion", str(exc))
+        finally:
+            self.ui(self.set_table_action_buttons_busy, False)
 
     def _execute_cross_table_expansion_thread(
         self,
