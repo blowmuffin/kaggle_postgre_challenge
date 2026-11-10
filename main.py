@@ -5450,6 +5450,8 @@ class App(ctk.CTk):
                 ),
                 post_commit_callback=self.begin_cross_table_expansion_finalization,
                 timing_report=timing_report,
+                requested_by=expansion_request["requested_by"],
+                workstation_name=socket.gethostname(),
             )
 
             # O COMMIT dos dados ja ocorreu. Daqui em diante a operacao precisa

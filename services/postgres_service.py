@@ -3,6 +3,7 @@ import csv
 import hashlib
 import io
 import json
+import os
 import re
 import shlex
 import sys
@@ -25,6 +26,7 @@ from config import (
     LEGACY_CONTROL_SCHEMA,
     REMOTE_STORAGE_DIR,
 )
+from services.expansion_fast import FastExpansionMixin
 from utils import (
     format_version_history_entry,
     int_to_version,
@@ -67,7 +69,7 @@ class OperationCancelledError(RuntimeError):
     pass
 
 
-class PostgresAdminService:
+class PostgresAdminService(FastExpansionMixin):
     VERSION_HISTORY_FORMAT_FULL = "full"
     VERSION_HISTORY_FORMAT_ENTRY = "entry"
     CROSS_TABLE_EXPANSION_OPERATION_KIND = "cross_table_expand_v1"
@@ -13795,6 +13797,8 @@ SELECT json_build_object(
         progress_callback=None,
         post_commit_callback=None,
         timing_report: dict | None = None,
+        requested_by: str | None = None,
+        workstation_name: str | None = None,
     ) -> dict:
         if timing_report is None:
             timing_report = self.create_cross_table_expansion_timing_report(
@@ -13958,6 +13962,24 @@ SELECT json_build_object(
             ),
         )
         self._raise_if_cancelled(cancel_event)
+
+        # Parallel, resumable server-side engine. It returns None when a recipe
+        # set must run on the original single-transaction path below.
+        if (os.getenv("PDM_EXPAND_ENGINE") or "fast").strip().lower() != "legacy":
+            fast_result = self._run_fast_cross_table_expansion(
+                database_name,
+                prepared,
+                destinations,
+                source_versions,
+                requested_by,
+                workstation_name,
+                cancel_event,
+                progress_callback,
+                post_commit_callback,
+                timing_report,
+            )
+            if fast_result is not None:
+                return fast_result
 
         with self.expansion_timing_scope(
             timing_report,
@@ -14960,6 +14982,10 @@ COMMIT;
     ) -> list[dict]:
         if timing_report is None:
             timing_report = (expansion_result or {}).get("timing_report")
+        if (expansion_result or {}).get("engine") == "fast":
+            # The server-side runner already registered the versions, exactly
+            # once, even if this Manager session had been disconnected.
+            return [dict(item) for item in expansion_result["registered_versions"]]
         with self.expansion_timing_scope(
             timing_report,
             "version",

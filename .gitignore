@@ -34,3 +34,7 @@ Thumbs.db
 build/
 dist/
 *.egg-info/
+
+# local benchmark credentials and scratch
+.local/
+.venv/
