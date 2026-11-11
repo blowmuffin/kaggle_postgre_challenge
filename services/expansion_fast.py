@@ -29,6 +29,7 @@ _INTEGER_TYPES = {"bigint", "integer", "smallint"}
 # violation, bad cast, unknown column ...): retrying cannot succeed, so the
 # job is rolled back at once, as the original single transaction would be.
 _DETERMINISTIC_SQLSTATE_CLASSES = {"0A", "21", "22", "23", "2F", "38", "39", "3F", "42", "44", "P0"}
+_CHUNK_WORK_MEM_FRACTION = 0.8   # share of work_mem one chunk's source rows may occupy
 
 
 class FastExpansionMixin:
@@ -58,11 +59,18 @@ class FastExpansionMixin:
             nproc if nproc <= 4 else nproc - nproc // 4
         )
         free = int(probe["max_connections"]) - int(probe["connections"]) - 5
+        work_mem = int(probe.get("work_mem_bytes") or 0)
+        row_bytes = int(probe.get("source_row_bytes") or 0)
+        fit = (
+            int(_CHUNK_WORK_MEM_FRACTION * work_mem / row_bytes)
+            if work_mem > 0 and row_bytes > 0 else 50000
+        )
+        chunk_max = max(500, min(50000, fit))
         return {
             "workers": max(1, min(workers, 32, free)),
             "chunk_rows": int(os.getenv("PDM_EXPAND_CHUNK_ROWS") or 0),
-            "chunk_min_rows": 2000,
-            "chunk_max_rows": 50000,
+            "chunk_min_rows": min(2000, chunk_max),
+            "chunk_max_rows": chunk_max,
             "sequence_cache": int(os.getenv("PDM_EXPAND_SEQUENCE_CACHE") or 256),
             "fk_mode": (
                 "rowwise"

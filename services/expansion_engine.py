@@ -814,6 +814,7 @@ CREATE TABLE IF NOT EXISTS {JOB_SCHEMA}.job_tasks (
     finished_at timestamptz,
     PRIMARY KEY (job_id, stage_no, task_no)
 ) WITH (fillfactor = 50);
+CREATE INDEX IF NOT EXISTS job_tasks_open ON {JOB_SCHEMA}.job_tasks (job_id, stage_no, task_no) WHERE state <> 'done';
 CREATE TABLE IF NOT EXISTS {JOB_SCHEMA}.job_attempts (
     job_id text NOT NULL REFERENCES {JOB_SCHEMA}.jobs ON DELETE CASCADE,
     attempt_no integer NOT NULL,
@@ -1539,7 +1540,7 @@ BEGIN
         FROM {JOB_SCHEMA}.job_tasks WHERE job_id = {j} AND state <> 'done';
         IF v_stage_no IS NOT NULL THEN
             SELECT * INTO v_task FROM {JOB_SCHEMA}.job_tasks
-            WHERE job_id = {j} AND stage_no = v_stage_no AND state = 'pending'
+            WHERE job_id = {j} AND stage_no = v_stage_no AND state = 'pending' AND state <> 'done'
             ORDER BY task_no LIMIT 1 FOR UPDATE SKIP LOCKED;
         END IF;
         IF v_stage_no IS NULL OR NOT FOUND THEN
@@ -1712,7 +1713,15 @@ SELECT json_build_object(
     'aggregates', COALESCE((
         SELECT json_agg(DISTINCT p.proname) FROM pg_proc p
         WHERE p.proname = ANY (ARRAY[{names}]::text[]) AND p.prokind IN ('a', 'w')),
-        '[]'::json)
+        '[]'::json),
+    'work_mem_bytes', pg_size_bytes(current_setting('work_mem')),
+    'source_row_bytes', (
+        -- never analysed (reltuples unknown): measure a few rows instead
+        SELECT COALESCE(
+            CASE WHEN c.reltuples > 0 THEN (pg_relation_size(c.oid) / c.reltuples)::bigint END,
+            (SELECT avg(pg_column_size(s))::bigint
+             FROM (SELECT * FROM {sql_ident(source_schema)}.{sql_ident(source_table)} LIMIT 200) s))
+        FROM pg_class c WHERE c.oid = {src}::regclass)
 )::text;
 SELECT to_regclass('{JOB_SCHEMA}.jobs') IS NOT NULL AS pgdm_has_jobs \\gset
 \\if :pgdm_has_jobs

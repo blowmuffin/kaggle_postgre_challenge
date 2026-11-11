@@ -1,6 +1,8 @@
+import os
 import re
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from services import expansion_engine as engine
 
@@ -232,6 +234,41 @@ class GeneratedSqlTests(unittest.TestCase):
                           f"{engine.sql_ident(table)})", sql)
         with self.assertRaises(engine.UnsupportedSql):
             engine.stale_job_sql("x'; DROP TABLE t1; --", [("public", "t1")])
+
+    def test_open_tasks_have_a_partial_index(self):
+        self.assertIn(
+            f"CREATE INDEX IF NOT EXISTS job_tasks_open ON {engine.JOB_SCHEMA}.job_tasks "
+            "(job_id, stage_no, task_no) WHERE state <> 'done';",
+            engine.SCHEMA_DDL,
+        )
+        self.assertIn("state = 'pending' AND state <> 'done'", engine.worker_sql(JOB))
+
+    def test_probe_reports_work_mem_and_row_size(self):
+        sql = engine.probe_sql("public", "raw_data", [])
+        self.assertIn("'work_mem_bytes'", sql)
+        self.assertIn("'source_row_bytes'", sql)
+
+
+class ChunkSizeConfigTests(unittest.TestCase):
+    PROBE = {"max_connections": 100, "connections": 5}
+
+    def config(self, **extra):
+        from services.expansion_fast import FastExpansionMixin
+
+        with patch.dict(os.environ, {"PDM_EXPAND_CHUNK_ROWS": ""}):
+            return FastExpansionMixin._fast_expansion_config(4, {**self.PROBE, **extra})
+
+    def test_chunk_fits_work_mem(self):
+        config = self.config(work_mem_bytes=4194304, source_row_bytes=2050)
+        self.assertEqual((config["chunk_min_rows"], config["chunk_max_rows"]), (1636, 1636))
+
+    def test_probe_without_memory_keys_keeps_old_bounds(self):
+        config = self.config()
+        self.assertEqual((config["chunk_min_rows"], config["chunk_max_rows"]), (2000, 50000))
+
+    def test_huge_work_mem_is_capped(self):
+        config = self.config(work_mem_bytes=2**40, source_row_bytes=100)
+        self.assertEqual((config["chunk_min_rows"], config["chunk_max_rows"]), (2000, 50000))
 
 
 if __name__ == "__main__":

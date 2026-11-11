@@ -9,7 +9,7 @@
 #   bash benchmarks/recovery_test.sh .local/bench.env manager_kill
 #   scenarios: manager_kill | runner_kill | postgres_crash | abort | all
 set -u
-ENV_FILE="${1:?env file}"; SCENARIO="${2:-all}"; DELAY="${DELAY:-4}"
+ENV_FILE="${1:?env file}"; SCENARIO="${2:-all}"; MIN_DONE="${MIN_DONE:-40}"
 SERVER=${SERVER:-"wsl.exe -d Ubuntu -u root --"}
 SERVER_REPO="${SERVER_REPO:-/mnt/d/kaggle/data-pipeline}"
 PY="${PY:-.venv/Scripts/python.exe}"
@@ -22,6 +22,15 @@ expand() { "$PY" tools/expand_cli.py --env "$ENV_FILE" run --quiet "$@" 2>&1 | t
 state() {
   psql_data -qAt -c "SELECT 'job ' || status || ', tasks committed ' || (SELECT count(*) FROM pgdm_expansion.job_tasks t WHERE t.job_id = j.job_id AND t.state = 'done') || '/' || (SELECT count(*) FROM pgdm_expansion.job_tasks t WHERE t.job_id = j.job_id) || ', attempts ' || (SELECT count(*) FROM pgdm_expansion.job_attempts a WHERE a.job_id = j.job_id) || ', suspended fks/indexes ' || jsonb_array_length(suspended_fks) || '/' || jsonb_array_length(suspended_indexes) FROM pgdm_expansion.jobs j ORDER BY created_at DESC LIMIT 1"
 }
+# Interrupt only once the job is really running: at least $MIN_DONE tasks committed.
+wait_mid_run() {
+  local n
+  for _ in $(seq 1 300); do
+    n=$(psql_data -qAt -c "SELECT count(*) FROM pgdm_expansion.job_tasks WHERE state = 'done'" 2> /dev/null | tr -cd '0-9')
+    [ "${n:-0}" -ge "$MIN_DONE" ] && return 0
+  done
+  echo "(the job never reached $MIN_DONE committed tasks)"
+}
 verify() {
   psql_data -q -f "$SERVER_REPO/benchmarks/verify.sql" 2>&1 | grep -E "FAIL|VERIFY|rows:"
   $SERVER bash "$SERVER_REPO/benchmarks/server_sql.sh" "$SERVER_REPO/$ENV_FILE" postgres_data_manager -qAt -c \
@@ -33,7 +42,7 @@ manager_kill() {
   reset
   "$PY" tools/expand_cli.py --env "$ENV_FILE" run --quiet > /dev/null 2>&1 &
   local pid=$!
-  sleep "$DELAY"; kill -9 "$pid" 2> /dev/null; echo "manager killed after ${DELAY}s: $(state)"
+  wait_mid_run; kill -9 "$pid" 2> /dev/null; echo "manager killed mid-run: $(state)"
   for _ in $(seq 1 120); do
     [ "$(psql_data -qAt -c "SELECT status FROM pgdm_expansion.jobs ORDER BY created_at DESC LIMIT 1")" = completed ] && break
     sleep 1
@@ -47,7 +56,7 @@ runner_kill() {
   echo "== Runner and every psql session killed -9 mid-run: Expand again must resume"
   reset
   "$PY" tools/expand_cli.py --env "$ENV_FILE" run --quiet > .local/recovery_first.log 2>&1 &
-  sleep "$DELAY"
+  wait_mid_run
   server "pkill -9 -x psql; pkill -9 -f '[r]unner.sh'; true"
   sleep 3; echo "after kill: $(state)"
   wait; tail -3 .local/recovery_first.log | cut -c1-300
@@ -59,7 +68,7 @@ postgres_crash() {
   echo "== PostgreSQL crashed (immediate restart) mid-run: Expand again must resume"
   reset
   "$PY" tools/expand_cli.py --env "$ENV_FILE" run --quiet > .local/recovery_first.log 2>&1 &
-  sleep "$DELAY"
+  wait_mid_run
   server "sudo -u postgres /usr/lib/postgresql/*/bin/pg_ctl -D \$(sudo -u postgres psql -qAt -c 'show data_directory') -m immediate stop > /dev/null 2>&1; systemctl restart postgresql"
   sleep 4; echo "after crash: $(state)"
   wait; tail -2 .local/recovery_first.log | cut -c1-300
@@ -71,7 +80,7 @@ abort() {
   echo "== Interrupted job discarded: destinations must return to their previous state"
   reset
   "$PY" tools/expand_cli.py --env "$ENV_FILE" run --quiet > /dev/null 2>&1 &
-  sleep "$DELAY"
+  wait_mid_run
   server "pkill -9 -x psql; pkill -9 -f '[r]unner.sh'; true"
   sleep 3; wait; echo "after kill: $(state)"
   "$PY" tools/expand_cli.py --env "$ENV_FILE" abort

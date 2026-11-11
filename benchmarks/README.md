@@ -94,7 +94,7 @@ WAL volume for one run.
 |---|---|---|
 | `PDM_EXPAND_ENGINE` | `fast` | `legacy` runs the original single-transaction engine |
 | `PDM_EXPAND_WORKERS` | cores (¾ of them above 4) | parallel sessions |
-| `PDM_EXPAND_CHUNK_ROWS` | adaptive, 2,000–50,000 | source rows per checkpointed chunk |
+| `PDM_EXPAND_CHUNK_ROWS` | adaptive: one chunk's source rows fit in `work_mem` (about 1,600 rows with the 4 MB default), never more than 50,000 | source rows per checkpointed chunk |
 | `PDM_EXPAND_FK_MODE` | `bulk` | `rowwise` keeps per-row foreign-key checks during the load |
 | `PDM_EXPAND_INDEX_MODE` | `bulk` | `rowwise` keeps every index maintained during the load |
 | `PDM_EXPAND_SEQUENCE_CACHE` | `256` | session-local identity cache during the load |
