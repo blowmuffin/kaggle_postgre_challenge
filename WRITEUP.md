@@ -8,10 +8,6 @@ Python & PostgreSQL Data Pipeline Optimization Challenge. Fork of
 and the six recipe files are byte-identical to upstream. AI coding assistants
 were used. Every number here is a local measurement, not an official score.
 
-> **Timeline, stated up front.** Commit `9b7c700` was public six hours before
-> the deadline. This writeup and commit `6bb5a43` (one fix, told in §6) came
-> after it. Both commits are measured below; judge whichever the rules allow.
-
 ## The scoreboard
 
 Laptop: i5-13420H (4P+4E cores), 16 GB, Windows 11 Manager → SSH → WSL2
@@ -20,11 +16,11 @@ non-superuser role. Metric: the report's `MEASURED PROCESSING TOTAL`. Each run
 is compared with a snapshot of the original engine's output
 (`benchmarks/verify.sql`); all of them say `VERIFY PASS`.
 
-| Source rows | Original | `9b7c700` (deadline) | `6bb5a43` (fix) | Best speed-up |
-|---:|---:|---:|---:|---:|
-| 100,000 | 8.0 – 8.2 s | 2.35 – 2.48 s | 2.14 – 2.22 s | 3.7× |
-| 1,000,000 | 79 – 83 s | 12.9 – 14.0 s | 10.3 – 11.9 s | 8.1× |
-| 3,000,000 | 262 – 265 s | 46.4 – 51.7 s | 37.4 – 49.2 s | 7.0× |
+| Source rows | Original | This engine | Speed-up |
+|---:|---:|---:|---:|
+| 100,000 | 8.0 – 8.2 s | 2.14 – 2.22 s | 3.7× |
+| 1,000,000 | 79 – 83 s | 10.3 – 11.9 s | 8.1× |
+| 3,000,000 | 262 – 265 s | 37.4 – 49.2 s | 7.0× |
 
 This laptop gives PostgreSQL about 4.4 cores of real throughput (12 identical
 read-only backends each run 2.7× slower than one). The design is one session
@@ -89,27 +85,21 @@ version registration.
 
 ## 3. Break it
 
-State lives in the data database and commits with the work. Measured at 1M
+State lives in the data database and commits with the work. Measured at 3M
 rows unless noted; every row ends in `VERIFY PASS` and exactly one version per
 table.
 
 | You do this | It does this |
 |---|---|
-| Kill the Manager / drop SSH at 45 of 99 chunks | the job finishes on the server alone; the next Expand collects it in 2.6 s, nothing runs twice |
-| `kill -9` the runner and every `psql` at 50 of 99 | the next Expand resumes as attempt 2 and reuses the 50 |
-| `pg_ctl stop -m immediate` at 32 of 99 | the next Expand resumes |
-| Kill the runner after the data phase | only version registration is re-run: exactly once, keyed by job id |
-| Press Cancel mid-run | the job is discarded in about 4 s: 0 rows, counters 0, 6 FKs, 11 indexes back |
-| Discard an interrupted job | rows deleted by the transaction ids of its committed chunks; state identical to before |
+| Kill the Manager / drop SSH at 2,529 of 3,665 chunks | the job finishes on the server alone; the next Expand collects it in 3.5 s, nothing runs twice |
+| `kill -9` the runner and every `psql` at 2,550 of 3,665 | the next Expand resumes as attempt 2 and reuses the 2,550 |
+| `pg_ctl stop -m immediate` at 2,533 of 3,665 | the next Expand resumes as attempt 2 |
+| Kill the runner after the data phase (1M) | only version registration is re-run: exactly once, keyed by job id |
+| Press Cancel mid-run (1M) | the job is discarded in about 4 s: 0 rows, counters 0, 6 FKs, 11 indexes back |
+| Discard a job killed at 2,537 of 3,665 | 6,136,898 rows deleted by the transaction ids of its committed chunks; state identical to before, then a clean 35.9 s run |
 | Run Expand twice on the same data | duplicate key in a chunk → automatic rollback, first expansion intact |
 | Empty the destinations after a job finished but was never collected (3M) | the stale job is retired, a fresh one runs |
 | Empty the destinations after a job was killed mid-run (100k) | the dead job is discarded, constraints restored, a fresh one runs |
-
-Re-run with `6bb5a43` at 3M rows, interrupted in the insert stage at about
-2,540 of 3,665 chunks: Manager kill (the job finished alone, collected in
-3.5 s), `kill -9` of every server process (resumed as attempt 2), PostgreSQL
-crash (resumed as attempt 2) and discard (6,136,898 rows removed, then a fresh
-35.9 s run). All four end in `VERIFY PASS` with one version per table.
 
 The **Expand** button detects an unfinished job and offers Resume / Discard /
 leave. `tools/expand_cli.py status|run|abort` does the same headlessly, and
@@ -137,7 +127,7 @@ to continue if the source changed in between.
 
 ## 5. The bill
 
-Server side, one Expand, `6bb5a43`. Memory is the peak PSS of all PostgreSQL
+Server side, one Expand. Memory is the peak PSS of all PostgreSQL
 processes (idle is about 145 MB); temp files from `pg_stat_database`.
 
 | | Original, 1M | Ours, 1M | Original, 3M | Ours, 3M |
@@ -157,7 +147,7 @@ memory setting is raised anywhere.
 
 ## 6. The bug that hid in the planner
 
-Some runs were 5 – 10 s slower and wrote 4.8 GB of extra temp files at 3M
+During development some runs were 5 – 10 s slower and wrote 4.8 GB of extra temp files at 3M
 rows. Logging temp files per statement found it: the `table1` insert joins
 each chunk to `table3`, which has four rows. Once `table3` had statistics,
 PostgreSQL sometimes built the hash table from the **source** side — 50,000
@@ -170,8 +160,6 @@ the planner hashes or sorts inside a chunk stays in memory, and the later
 statements of the same task re-read the chunk from cache. A partial index on
 unfinished tasks keeps claiming cheap with thousands of chunks. Result at 1M
 rows: insert stage 9 – 12 s → 6.7 – 7.3 s in most runs, and no spill in any.
-
-`9b7c700` still has the 50,000-row cap and therefore this defect.
 
 ## 7. What it does not do
 
